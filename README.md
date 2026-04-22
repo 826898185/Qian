@@ -64,6 +64,9 @@ uvicorn app.main:app --reload --port 8000
 - `GET /api/health`
 - `GET /api/symbols`
 - `GET /api/signals`
+- `POST /api/scans/run?lookback=260`（手动触发一次扫描并落库）
+- `GET /api/scans?limit=30`（查看历史扫描批次）
+- `GET /api/scans/{run_id}`（查看某次批次详情）
 - `GET /api/stocks/{symbol}/patterns?lookback=220`
 - `GET /api/stocks/{symbol}/risk?lookback=220`
 - `POST /api/config`
@@ -79,6 +82,28 @@ uvicorn app.main:app --reload --port 8000
 3. 剔除停牌（以最近交易日成交量 `vol > 0` 作为可交易条件）
 
 如需调试可设置 `K13_SCAN_LIMIT` 限制扫描数量；生产建议保持 `0`（全市场）。
+
+### 每日跑批与历史快照
+
+系统已内置 SQLite 落库（默认 `backend/data/k13.db`）：
+
+- `scan_runs`：每次扫描任务元信息（时间、数据源、股票池大小、信号数）
+- `signal_snapshots`：该次任务输出的信号快照（symbol、score、风险等级、关键价位）
+
+你可以手动执行一次：
+
+```bash
+cd /workspace
+python3 -m backend.scripts.run_scan --lookback 260
+```
+
+若需每日自动跑批，可在服务器设置 cron（示例：每个交易日 16:10）：
+
+```bash
+10 16 * * 1-5 cd /workspace && /usr/bin/python3 -m backend.scripts.run_scan --lookback 260 >> /workspace/backend/data/scan_cron.log 2>&1
+```
+
+> 注：节假日 cron 仍会触发，策略会基于最近交易日数据执行；如需严格交易日触发，可再接交易日历判断脚本。
 
 ## 前端启动
 
