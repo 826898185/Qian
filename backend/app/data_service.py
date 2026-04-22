@@ -90,6 +90,9 @@ class BaseDataService:
     def list_symbols(self) -> list[str]:
         raise NotImplementedError
 
+    def metadata(self) -> dict[str, Any]:
+        return {"source": self.source}
+
     def get_ohlcv(self, symbol: str, lookback: int = 260) -> pd.DataFrame:
         raise NotImplementedError
 
@@ -115,12 +118,13 @@ class BaseDataService:
             if patterns.empty:
                 continue
 
-            latest = patterns.iloc[-1].to_dict()
-            risk = latest_risk_signal(df, latest_pattern=patterns.iloc[-1])
-            latest["symbol"] = symbol
-            latest["risk_level"] = risk["level"]
-            latest["risk_message"] = risk["message"]
-            result.append(latest)
+            latest_pattern = patterns.iloc[-1]
+            risk = latest_risk_signal(df, latest_pattern=latest_pattern)
+            row = latest_pattern.to_dict()
+            row["symbol"] = symbol
+            row["risk_level"] = risk["level"]
+            row["risk_message"] = risk["message"]
+            result.append(row)
 
         result.sort(key=lambda row: row["score"], reverse=True)
         return result
@@ -134,6 +138,15 @@ class DemoDataService(BaseDataService):
         self._data: dict[str, pd.DataFrame] = {}
         for idx, symbol in enumerate(symbols):
             self._data[symbol] = _generate_symbol_data(seed=42 + idx * 9)
+        self._meta = {
+            "source": self.source,
+            "universe_size": len(self._data),
+            "filters": {
+                "exclude_st": False,
+                "min_list_days": 0,
+                "exclude_suspended": False,
+            },
+        }
 
     def list_symbols(self) -> list[str]:
         return list(self._data.keys())
@@ -146,11 +159,14 @@ class DemoDataService(BaseDataService):
             df = df.tail(lookback).reset_index(drop=True)
         return df
 
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._meta)
+
 
 class TushareDataService(BaseDataService):
     source = "tushare"
 
-    def __init__(self, token: str, symbols: list[str] | None = None, scan_limit: int = 60, default_lookback: int = 260) -> None:
+    def __init__(self, token: str, symbols: list[str] | None = None, scan_limit: int = 0, default_lookback: int = 260) -> None:
         if not token:
             raise ValueError("K13_DATA_SOURCE=tushare 时必须提供 TUSHARE_TOKEN。")
 
@@ -161,9 +177,13 @@ class TushareDataService(BaseDataService):
 
         self._pro = ts.pro_api(token)
         self._default_lookback = max(60, int(default_lookback))
-        self._scan_limit = max(1, int(scan_limit))
+        # 0 表示不限制，默认全市场扫描；>0 仅用于调试或快速演示
+        self._scan_limit = max(0, int(scan_limit))
+        self._manual_symbols = symbols if symbols else []
+        self._scan_cache: dict[str, Any] = {}
+        self._meta: dict[str, Any] = {}
         self._validate_token()
-        self._symbols = symbols if symbols else self._load_default_symbols()
+        self._symbols = self._build_eligible_universe()
         if not self._symbols:
             raise RuntimeError("Tushare 股票池为空，请设置 K13_SYMBOLS 或检查 token 权限。")
 
@@ -175,19 +195,114 @@ class TushareDataService(BaseDataService):
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"Tushare 鉴权失败，请检查 TUSHARE_TOKEN：{exc}") from exc
 
-    def _load_default_symbols(self) -> list[str]:
-        df = self._pro.stock_basic(
+    def _latest_open_trade_date(self) -> str:
+        today = datetime.today().strftime("%Y%m%d")
+        start = (datetime.today() - timedelta(days=40)).strftime("%Y%m%d")
+        cal = self._pro.trade_cal(
+            exchange="SSE",
+            start_date=start,
+            end_date=today,
+            fields="cal_date,is_open",
+        )
+        if cal is None or cal.empty:
+            raise RuntimeError("无法获取交易日历。")
+        cal = cal[pd.to_numeric(cal["is_open"], errors="coerce").fillna(0).astype(int) == 1]
+        if cal.empty:
+            raise RuntimeError("近期无可用交易日。")
+        return str(cal["cal_date"].max())
+
+    def _recent_open_trade_dates(self, end_trade_date: str, count: int) -> list[str]:
+        end_dt = datetime.strptime(end_trade_date, "%Y%m%d")
+        start_dt = end_dt - timedelta(days=max(120, count * 3))
+        cal = self._pro.trade_cal(
+            exchange="SSE",
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=end_trade_date,
+            fields="cal_date,is_open",
+        )
+        if cal is None or cal.empty:
+            return []
+        cal = cal[pd.to_numeric(cal["is_open"], errors="coerce").fillna(0).astype(int) == 1]
+        if cal.empty:
+            return []
+        dates = sorted(cal["cal_date"].astype(str).tolist())
+        return dates[-count:]
+
+    def _load_active_symbols(self, trade_date: str) -> set[str]:
+        # daily(trade_date=xx) 仅返回当日有成交的股票，天然剔除停牌
+        day_df = self._pro.daily(
+            trade_date=trade_date,
+            fields="ts_code,vol",
+        )
+        if day_df is None or day_df.empty:
+            return set()
+        day_df["vol"] = pd.to_numeric(day_df["vol"], errors="coerce").fillna(0)
+        return set(day_df.loc[day_df["vol"] > 0, "ts_code"].astype(str).tolist())
+
+    def _build_eligible_universe(self) -> list[str]:
+        latest_trade_date = self._latest_open_trade_date()
+        list_cutoff = (
+            datetime.strptime(latest_trade_date, "%Y%m%d") - timedelta(days=60)
+        ).strftime("%Y%m%d")
+
+        basic = self._pro.stock_basic(
             exchange="",
             list_status="L",
             fields="ts_code,name,list_date",
         )
-        if df is None or df.empty:
+        if basic is None or basic.empty:
             return []
-        df = df.sort_values("ts_code")
-        return df["ts_code"].head(self._scan_limit).tolist()
+
+        basic = basic.copy()
+        basic["ts_code"] = basic["ts_code"].astype(str)
+        basic["name"] = basic["name"].astype(str)
+        basic["list_date"] = basic["list_date"].astype(str)
+
+        total_active_listed = len(basic)
+
+        # 过滤 ST（包含 *ST、ST）+ 上市不足 60 天
+        is_st = basic["name"].str.upper().str.contains("ST", na=False)
+        old_enough = basic["list_date"] <= list_cutoff
+        after_st_count = int((~is_st).sum())
+        after_listdays_count = int((~is_st & old_enough).sum())
+        base_filtered = basic.loc[~is_st & old_enough, "ts_code"].tolist()
+
+        if self._manual_symbols:
+            manual = set(self._manual_symbols)
+            base_filtered = [code for code in base_filtered if code in manual]
+
+        active_symbols = self._load_active_symbols(latest_trade_date)
+        universe = sorted(set(base_filtered).intersection(active_symbols))
+
+        if self._scan_limit > 0:
+            universe = universe[: self._scan_limit]
+
+        self._meta = {
+            "source": self.source,
+            "latest_trade_date": latest_trade_date,
+            "universe_size": len(universe),
+            "filters": {
+                "exclude_st": True,
+                "min_list_days": 60,
+                "exclude_suspended": True,
+            },
+            "counts": {
+                "listed_active_total": total_active_listed,
+                "after_exclude_st": after_st_count,
+                "after_min_list_days": after_listdays_count,
+                "active_tradable_today": len(active_symbols),
+                "eligible_final": len(universe),
+            },
+            "manual_symbol_pool_enabled": bool(self._manual_symbols),
+            "scan_limit": self._scan_limit,
+        }
+        return universe
 
     def list_symbols(self) -> list[str]:
         return list(self._symbols)
+
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._meta)
 
     def get_ohlcv(self, symbol: str, lookback: int = 260) -> pd.DataFrame:
         lookback_days = max(30, int(lookback or self._default_lookback))
@@ -216,6 +331,83 @@ class TushareDataService(BaseDataService):
             df = df.tail(lookback_days).reset_index(drop=True)
         return df
 
+    def _fetch_daily_panel(self, trade_dates: list[str]) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for trade_date in trade_dates:
+            part = self._pro.daily(
+                trade_date=trade_date,
+                fields="ts_code,trade_date,open,high,low,close,vol",
+            )
+            if part is None or part.empty:
+                continue
+            frames.append(part)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    @staticmethod
+    def _normalize_panel(panel: pd.DataFrame) -> pd.DataFrame:
+        p = panel.copy()
+        p["trade_date"] = p["trade_date"].astype(str)
+        for col in ("open", "high", "low", "close", "vol"):
+            p[col] = pd.to_numeric(p[col], errors="coerce")
+        p = p.dropna(subset=["open", "high", "low", "close"])
+        p = p.rename(columns={"trade_date": "date", "vol": "volume"})
+        p["date"] = pd.to_datetime(p["date"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
+        p["volume"] = (p["volume"].fillna(0) * 100).astype(int)
+        return p[["ts_code", "date", "open", "high", "low", "close", "volume"]]
+
+    def scan_latest_signals(self, cfg: FactorConfig, lookback: int = 260) -> list[dict[str, Any]]:
+        if not self._symbols:
+            return []
+
+        lookback_days = max(60, int(lookback or self._default_lookback))
+        latest_trade_date = self._latest_open_trade_date()
+        cache_key = f"{latest_trade_date}:{lookback_days}:{len(self._symbols)}"
+        if cache_key in self._scan_cache:
+            return list(self._scan_cache[cache_key])
+
+        trade_dates = self._recent_open_trade_dates(
+            end_trade_date=latest_trade_date,
+            count=lookback_days,
+        )
+        panel = self._fetch_daily_panel(trade_dates=trade_dates)
+        if panel.empty:
+            self._scan_cache[cache_key] = []
+            return []
+
+        panel = panel[panel["ts_code"].isin(self._symbols)].reset_index(drop=True)
+        if panel.empty:
+            self._scan_cache[cache_key] = []
+            return []
+
+        panel = self._normalize_panel(panel)
+        panel = panel.sort_values(["ts_code", "date"]).reset_index(drop=True)
+
+        result: list[dict[str, Any]] = []
+        for symbol, group_df in panel.groupby("ts_code"):
+            df = group_df[["date", "open", "high", "low", "close", "volume"]].tail(lookback_days).reset_index(drop=True)
+            if len(df) < 60:
+                continue
+
+            patterns = detect_k13_patterns(df, cfg)
+            if patterns.empty:
+                continue
+
+            latest_pattern = patterns.iloc[-1]
+            risk = latest_risk_signal(df, latest_pattern=latest_pattern)
+            row = latest_pattern.to_dict()
+            row["symbol"] = symbol
+            row["risk_level"] = risk["level"]
+            row["risk_message"] = risk["message"]
+            result.append(row)
+
+        result.sort(key=lambda row: row["score"], reverse=True)
+        self._scan_cache.clear()
+        self._scan_cache[cache_key] = result
+        return result
+
 
 def _env_symbols() -> list[str]:
     raw = os.getenv("K13_SYMBOLS", "")
@@ -232,7 +424,7 @@ def create_data_service() -> BaseDataService:
 
     if source == "tushare":
         token = os.getenv("TUSHARE_TOKEN", "").strip()
-        scan_limit = int(os.getenv("K13_SCAN_LIMIT", "60"))
+        scan_limit = int(os.getenv("K13_SCAN_LIMIT", "0"))
         lookback = int(os.getenv("K13_LOOKBACK_DAYS", "260"))
         return TushareDataService(
             token=token,

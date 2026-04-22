@@ -25,8 +25,9 @@ app.add_middleware(
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "data_source": DATA.source}
+def health() -> dict[str, Any]:
+    meta = DATA.metadata() if hasattr(DATA, "metadata") else {"source": DATA.source}
+    return {"status": "ok", "data_source": DATA.source, "meta": meta}
 
 
 @app.get("/api/symbols")
@@ -38,6 +39,7 @@ def symbols() -> dict[str, list[str]]:
 def signals(lookback: int = 260) -> dict[str, Any]:
     return {
         "config": CFG.to_dict(),
+        "meta": DATA.metadata() if hasattr(DATA, "metadata") else {"source": DATA.source},
         "signals": DATA.scan_latest_signals(CFG, lookback=lookback),
     }
 

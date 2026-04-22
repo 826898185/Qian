@@ -41,10 +41,10 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 K13_DATA_SOURCE=tushare
 TUSHARE_TOKEN=你的token
-# 可选：限定扫描股票池（逗号分隔）
+# 可选：限定扫描股票池（逗号分隔；留空表示全A股）
 # K13_SYMBOLS=600519.SH,000858.SZ,300750.SZ
-# 可选：当未配置股票池时，自动扫描前 N 只上市股票
-# K13_SCAN_LIMIT=60
+# 可选：股票池上限（0 表示不限制，即全市场）
+# K13_SCAN_LIMIT=0
 # 可选：默认拉取日线长度
 # K13_LOOKBACK_DAYS=260
 ```
@@ -68,7 +68,17 @@ uvicorn app.main:app --reload --port 8000
 - `GET /api/stocks/{symbol}/risk?lookback=220`
 - `POST /api/config`
 
-其中 `GET /api/health` 会返回当前数据源（`demo/tushare`），方便你确认是否切换成功。
+其中 `GET /api/health` 会返回当前数据源（`demo/tushare`）及股票池过滤统计，方便你确认筛选是否生效。
+
+### 全A股自动过滤规则（Tushare 模式）
+
+当使用 `K13_DATA_SOURCE=tushare` 且未设置 `K13_SYMBOLS` 时，系统默认从全A股筛选：
+
+1. 剔除 ST（名称包含 `ST` / `*ST`）  
+2. 剔除上市不满 60 天  
+3. 剔除停牌（以最近交易日成交量 `vol > 0` 作为可交易条件）
+
+如需调试可设置 `K13_SCAN_LIMIT` 限制扫描数量；生产建议保持 `0`（全市场）。
 
 ## 前端启动
 
