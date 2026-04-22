@@ -1,0 +1,436 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from .factor_engine import FactorConfig, detect_k13_patterns, latest_risk_signal
+
+
+def _inject_k13_pattern(df: pd.DataFrame, core1_idx: int) -> pd.DataFrame:
+    """Inject a bullish 1+3 pattern to make demo data deterministic."""
+    d = df.copy()
+    if core1_idx < 2 or core1_idx + 5 >= len(d):
+        return d
+
+    prev_idx = core1_idx - 1
+    i1, i2, i3 = core1_idx + 1, core1_idx + 2, core1_idx + 3
+
+    prev_close = float(d.loc[prev_idx, "close"])
+    d.loc[prev_idx, "open"] = round(prev_close * 1.01, 2)
+    d.loc[prev_idx, "close"] = round(prev_close * 0.99, 2)
+    d.loc[prev_idx, "high"] = round(max(d.loc[prev_idx, "open"], d.loc[prev_idx, "close"]) * 1.01, 2)
+    d.loc[prev_idx, "low"] = round(min(d.loc[prev_idx, "open"], d.loc[prev_idx, "close"]) * 0.99, 2)
+
+    c1_open = round(prev_close * 0.995, 2)
+    c1_close = round(prev_close * 1.01, 2)
+    d.loc[core1_idx, "open"] = c1_open
+    d.loc[core1_idx, "close"] = c1_close
+    d.loc[core1_idx, "high"] = round(c1_close * 1.01, 2)
+    d.loc[core1_idx, "low"] = round(c1_open * 0.995, 2)
+
+    close1 = round(c1_close * 1.02, 2)
+    close2 = round(c1_close * 1.03, 2)
+    close3 = round(c1_close * 1.05, 2)
+
+    d.loc[i1, "open"] = round(c1_close * 1.005, 2)
+    d.loc[i1, "close"] = close1
+    d.loc[i1, "high"] = round(close1 * 1.01, 2)
+    d.loc[i1, "low"] = round(min(d.loc[i1, "open"], close1) * 0.997, 2)
+
+    d.loc[i2, "open"] = round(close1 * 1.001, 2)
+    d.loc[i2, "close"] = close2
+    d.loc[i2, "high"] = round(close2 * 1.01, 2)
+    d.loc[i2, "low"] = round(min(d.loc[i2, "open"], close2) * 0.997, 2)
+
+    d.loc[i3, "open"] = round(close2 * 1.002, 2)
+    d.loc[i3, "close"] = close3
+    d.loc[i3, "high"] = round(close3 * 1.01, 2)
+    d.loc[i3, "low"] = round(min(d.loc[i3, "open"], close3) * 0.998, 2)
+
+    return d
+
+
+def _generate_symbol_data(periods: int = 260, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(end=datetime.today().date(), periods=periods)
+
+    base_price = rng.uniform(8, 80)
+    drift = rng.uniform(0.0002, 0.0012)
+    noise = rng.normal(0, 0.02, periods)
+    close = [base_price]
+    for i in range(1, periods):
+        close.append(max(2.0, close[-1] * (1 + drift + noise[i])))
+    close = np.array(close)
+
+    open_ = close * (1 + rng.normal(0, 0.006, periods))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0.01, 0.004, periods)))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0.01, 0.004, periods)))
+    volume = rng.integers(8_000_000, 80_000_000, periods)
+
+    df = pd.DataFrame(
+        {
+            "date": dates.strftime("%Y-%m-%d"),
+            "open": np.round(open_, 2),
+            "high": np.round(high, 2),
+            "low": np.round(low, 2),
+            "close": np.round(close, 2),
+            "volume": volume.astype(int),
+        }
+    )
+    return _inject_k13_pattern(df, core1_idx=120)
+
+
+class BaseDataService:
+    source: str = "base"
+
+    def list_symbols(self) -> list[str]:
+        raise NotImplementedError
+
+    def metadata(self) -> dict[str, Any]:
+        return {"source": self.source}
+
+    def get_ohlcv(self, symbol: str, lookback: int = 260) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def get_patterns(self, symbol: str, cfg: FactorConfig, lookback: int = 260) -> pd.DataFrame:
+        df = self.get_ohlcv(symbol=symbol, lookback=lookback)
+        return detect_k13_patterns(df, cfg)
+
+    def get_latest_risk(self, symbol: str, cfg: FactorConfig, lookback: int = 260) -> dict[str, Any]:
+        price_df = self.get_ohlcv(symbol=symbol, lookback=lookback)
+        patterns = detect_k13_patterns(price_df, cfg)
+        latest_pattern = patterns.iloc[-1] if not patterns.empty else None
+        return latest_risk_signal(price_df, latest_pattern)
+
+    def scan_latest_signals(self, cfg: FactorConfig, lookback: int = 260) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for symbol in self.list_symbols():
+            try:
+                df = self.get_ohlcv(symbol=symbol, lookback=lookback)
+            except Exception:
+                continue
+
+            patterns = detect_k13_patterns(df, cfg)
+            if patterns.empty:
+                continue
+
+            latest_pattern = patterns.iloc[-1]
+            risk = latest_risk_signal(df, latest_pattern=latest_pattern)
+            row = latest_pattern.to_dict()
+            row["symbol"] = symbol
+            row["risk_level"] = risk["level"]
+            row["risk_message"] = risk["message"]
+            result.append(row)
+
+        result.sort(key=lambda row: row["score"], reverse=True)
+        return result
+
+
+class DemoDataService(BaseDataService):
+    source = "demo"
+
+    def __init__(self) -> None:
+        symbols = ["600519.SH", "000858.SZ", "300750.SZ", "601318.SH", "002594.SZ"]
+        self._data: dict[str, pd.DataFrame] = {}
+        for idx, symbol in enumerate(symbols):
+            self._data[symbol] = _generate_symbol_data(seed=42 + idx * 9)
+        self._meta = {
+            "source": self.source,
+            "universe_size": len(self._data),
+            "filters": {
+                "exclude_st": False,
+                "min_list_days": 0,
+                "exclude_suspended": False,
+            },
+        }
+
+    def list_symbols(self) -> list[str]:
+        return list(self._data.keys())
+
+    def get_ohlcv(self, symbol: str, lookback: int = 260) -> pd.DataFrame:
+        if symbol not in self._data:
+            raise KeyError(f"Symbol not found: {symbol}")
+        df = self._data[symbol].copy()
+        if lookback > 0:
+            df = df.tail(lookback).reset_index(drop=True)
+        return df
+
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._meta)
+
+
+class TushareDataService(BaseDataService):
+    source = "tushare"
+
+    def __init__(self, token: str, symbols: list[str] | None = None, scan_limit: int = 0, default_lookback: int = 260) -> None:
+        if not token:
+            raise ValueError("K13_DATA_SOURCE=tushare 时必须提供 TUSHARE_TOKEN。")
+
+        try:
+            import tushare as ts
+        except ImportError as exc:
+            raise RuntimeError("未安装 tushare，请先执行 pip install -r backend/requirements.txt") from exc
+
+        self._pro = ts.pro_api(token)
+        self._default_lookback = max(60, int(default_lookback))
+        # 0 表示不限制，默认全市场扫描；>0 仅用于调试或快速演示
+        self._scan_limit = max(0, int(scan_limit))
+        self._manual_symbols = symbols if symbols else []
+        self._scan_cache: dict[str, Any] = {}
+        self._meta: dict[str, Any] = {}
+        self._validate_token()
+        self._symbols = self._build_eligible_universe()
+        if not self._symbols:
+            raise RuntimeError("Tushare 股票池为空，请设置 K13_SYMBOLS 或检查 token 权限。")
+
+    def _validate_token(self) -> None:
+        """Fail fast with clear message when token is invalid."""
+        today = datetime.today().strftime("%Y%m%d")
+        try:
+            _ = self._pro.trade_cal(exchange="", start_date=today, end_date=today)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Tushare 鉴权失败，请检查 TUSHARE_TOKEN：{exc}") from exc
+
+    def _latest_open_trade_date(self) -> str:
+        today = datetime.today().strftime("%Y%m%d")
+        start = (datetime.today() - timedelta(days=40)).strftime("%Y%m%d")
+        cal = self._pro.trade_cal(
+            exchange="SSE",
+            start_date=start,
+            end_date=today,
+            fields="cal_date,is_open",
+        )
+        if cal is None or cal.empty:
+            raise RuntimeError("无法获取交易日历。")
+        cal = cal[pd.to_numeric(cal["is_open"], errors="coerce").fillna(0).astype(int) == 1]
+        if cal.empty:
+            raise RuntimeError("近期无可用交易日。")
+        return str(cal["cal_date"].max())
+
+    def _recent_open_trade_dates(self, end_trade_date: str, count: int) -> list[str]:
+        end_dt = datetime.strptime(end_trade_date, "%Y%m%d")
+        start_dt = end_dt - timedelta(days=max(120, count * 3))
+        cal = self._pro.trade_cal(
+            exchange="SSE",
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=end_trade_date,
+            fields="cal_date,is_open",
+        )
+        if cal is None or cal.empty:
+            return []
+        cal = cal[pd.to_numeric(cal["is_open"], errors="coerce").fillna(0).astype(int) == 1]
+        if cal.empty:
+            return []
+        dates = sorted(cal["cal_date"].astype(str).tolist())
+        return dates[-count:]
+
+    def _load_active_symbols(self, trade_date: str) -> set[str]:
+        # daily(trade_date=xx) 仅返回当日有成交的股票，天然剔除停牌
+        day_df = self._pro.daily(
+            trade_date=trade_date,
+            fields="ts_code,vol",
+        )
+        if day_df is None or day_df.empty:
+            return set()
+        day_df["vol"] = pd.to_numeric(day_df["vol"], errors="coerce").fillna(0)
+        return set(day_df.loc[day_df["vol"] > 0, "ts_code"].astype(str).tolist())
+
+    def _build_eligible_universe(self) -> list[str]:
+        latest_trade_date = self._latest_open_trade_date()
+        list_cutoff = (
+            datetime.strptime(latest_trade_date, "%Y%m%d") - timedelta(days=60)
+        ).strftime("%Y%m%d")
+
+        basic = self._pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,name,list_date",
+        )
+        if basic is None or basic.empty:
+            return []
+
+        basic = basic.copy()
+        basic["ts_code"] = basic["ts_code"].astype(str)
+        basic["name"] = basic["name"].astype(str)
+        basic["list_date"] = basic["list_date"].astype(str)
+
+        total_active_listed = len(basic)
+
+        # 过滤 ST（包含 *ST、ST）+ 上市不足 60 天
+        is_st = basic["name"].str.upper().str.contains("ST", na=False)
+        old_enough = basic["list_date"] <= list_cutoff
+        after_st_count = int((~is_st).sum())
+        after_listdays_count = int((~is_st & old_enough).sum())
+        base_filtered = basic.loc[~is_st & old_enough, "ts_code"].tolist()
+
+        if self._manual_symbols:
+            manual = set(self._manual_symbols)
+            base_filtered = [code for code in base_filtered if code in manual]
+
+        active_symbols = self._load_active_symbols(latest_trade_date)
+        universe = sorted(set(base_filtered).intersection(active_symbols))
+
+        if self._scan_limit > 0:
+            universe = universe[: self._scan_limit]
+
+        self._meta = {
+            "source": self.source,
+            "latest_trade_date": latest_trade_date,
+            "universe_size": len(universe),
+            "filters": {
+                "exclude_st": True,
+                "min_list_days": 60,
+                "exclude_suspended": True,
+            },
+            "counts": {
+                "listed_active_total": total_active_listed,
+                "after_exclude_st": after_st_count,
+                "after_min_list_days": after_listdays_count,
+                "active_tradable_today": len(active_symbols),
+                "eligible_final": len(universe),
+            },
+            "manual_symbol_pool_enabled": bool(self._manual_symbols),
+            "scan_limit": self._scan_limit,
+        }
+        return universe
+
+    def list_symbols(self) -> list[str]:
+        return list(self._symbols)
+
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._meta)
+
+    def get_ohlcv(self, symbol: str, lookback: int = 260) -> pd.DataFrame:
+        lookback_days = max(30, int(lookback or self._default_lookback))
+        end_dt = datetime.today().date()
+        start_dt = end_dt - timedelta(days=lookback_days * 2)
+
+        raw = self._pro.daily(
+            ts_code=symbol,
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=end_dt.strftime("%Y%m%d"),
+            fields="ts_code,trade_date,open,high,low,close,vol",
+        )
+        if raw is None or raw.empty:
+            raise KeyError(f"Symbol not found or no data: {symbol}")
+
+        raw = raw.sort_values("trade_date").reset_index(drop=True)
+        raw = raw.rename(columns={"trade_date": "date", "vol": "volume"})
+        raw["date"] = pd.to_datetime(raw["date"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
+        raw["volume"] = (pd.to_numeric(raw["volume"], errors="coerce").fillna(0) * 100).astype(int)
+
+        for col in ("open", "high", "low", "close"):
+            raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+        df = raw[["date", "open", "high", "low", "close", "volume"]].dropna().reset_index(drop=True)
+        if lookback_days > 0:
+            df = df.tail(lookback_days).reset_index(drop=True)
+        return df
+
+    def _fetch_daily_panel(self, trade_dates: list[str]) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for trade_date in trade_dates:
+            part = self._pro.daily(
+                trade_date=trade_date,
+                fields="ts_code,trade_date,open,high,low,close,vol",
+            )
+            if part is None or part.empty:
+                continue
+            frames.append(part)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    @staticmethod
+    def _normalize_panel(panel: pd.DataFrame) -> pd.DataFrame:
+        p = panel.copy()
+        p["trade_date"] = p["trade_date"].astype(str)
+        for col in ("open", "high", "low", "close", "vol"):
+            p[col] = pd.to_numeric(p[col], errors="coerce")
+        p = p.dropna(subset=["open", "high", "low", "close"])
+        p = p.rename(columns={"trade_date": "date", "vol": "volume"})
+        p["date"] = pd.to_datetime(p["date"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
+        p["volume"] = (p["volume"].fillna(0) * 100).astype(int)
+        return p[["ts_code", "date", "open", "high", "low", "close", "volume"]]
+
+    def scan_latest_signals(self, cfg: FactorConfig, lookback: int = 260) -> list[dict[str, Any]]:
+        if not self._symbols:
+            return []
+
+        lookback_days = max(60, int(lookback or self._default_lookback))
+        latest_trade_date = self._latest_open_trade_date()
+        cache_key = f"{latest_trade_date}:{lookback_days}:{len(self._symbols)}"
+        if cache_key in self._scan_cache:
+            return list(self._scan_cache[cache_key])
+
+        trade_dates = self._recent_open_trade_dates(
+            end_trade_date=latest_trade_date,
+            count=lookback_days,
+        )
+        panel = self._fetch_daily_panel(trade_dates=trade_dates)
+        if panel.empty:
+            self._scan_cache[cache_key] = []
+            return []
+
+        panel = panel[panel["ts_code"].isin(self._symbols)].reset_index(drop=True)
+        if panel.empty:
+            self._scan_cache[cache_key] = []
+            return []
+
+        panel = self._normalize_panel(panel)
+        panel = panel.sort_values(["ts_code", "date"]).reset_index(drop=True)
+
+        result: list[dict[str, Any]] = []
+        for symbol, group_df in panel.groupby("ts_code"):
+            df = group_df[["date", "open", "high", "low", "close", "volume"]].tail(lookback_days).reset_index(drop=True)
+            if len(df) < 60:
+                continue
+
+            patterns = detect_k13_patterns(df, cfg)
+            if patterns.empty:
+                continue
+
+            latest_pattern = patterns.iloc[-1]
+            risk = latest_risk_signal(df, latest_pattern=latest_pattern)
+            row = latest_pattern.to_dict()
+            row["symbol"] = symbol
+            row["risk_level"] = risk["level"]
+            row["risk_message"] = risk["message"]
+            result.append(row)
+
+        result.sort(key=lambda row: row["score"], reverse=True)
+        self._scan_cache.clear()
+        self._scan_cache[cache_key] = result
+        return result
+
+
+def _env_symbols() -> list[str]:
+    raw = os.getenv("K13_SYMBOLS", "")
+    if not raw.strip():
+        return []
+    symbols = [item.strip().upper() for item in raw.split(",") if item.strip()]
+    return list(dict.fromkeys(symbols))
+
+
+def create_data_service() -> BaseDataService:
+    source = os.getenv("K13_DATA_SOURCE", "demo").strip().lower()
+    if source == "demo":
+        return DemoDataService()
+
+    if source == "tushare":
+        token = os.getenv("TUSHARE_TOKEN", "").strip()
+        scan_limit = int(os.getenv("K13_SCAN_LIMIT", "0"))
+        lookback = int(os.getenv("K13_LOOKBACK_DAYS", "260"))
+        return TushareDataService(
+            token=token,
+            symbols=_env_symbols(),
+            scan_limit=scan_limit,
+            default_lookback=lookback,
+        )
+
+    raise ValueError(f"Unsupported K13_DATA_SOURCE: {source}. 可选: demo / tushare")
