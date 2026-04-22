@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from .data_service import DataService
+from .data_service import create_data_service
 from .factor_engine import FactorConfig, detect_k13_patterns, latest_risk_signal
+
+load_dotenv()
 
 app = FastAPI(title="K13 Strategy API", version="0.1.0")
 CFG = FactorConfig()
-DATA = DataService()
+DATA = create_data_service()
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,7 +26,7 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "data_source": DATA.source}
 
 
 @app.get("/api/symbols")
@@ -32,22 +35,20 @@ def symbols() -> dict[str, list[str]]:
 
 
 @app.get("/api/signals")
-def signals() -> dict[str, Any]:
+def signals(lookback: int = 260) -> dict[str, Any]:
     return {
         "config": CFG.to_dict(),
-        "signals": DATA.scan_latest_signals(CFG),
+        "signals": DATA.scan_latest_signals(CFG, lookback=lookback),
     }
 
 
 @app.get("/api/stocks/{symbol}/patterns")
 def stock_patterns(symbol: str, lookback: int = 180) -> dict[str, Any]:
     try:
-        df = DATA.get_ohlcv(symbol)
+        df = DATA.get_ohlcv(symbol=symbol, lookback=lookback)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    if lookback > 0:
-        df = df.tail(lookback).reset_index(drop=True)
     patterns = detect_k13_patterns(df, CFG)
     return {"symbol": symbol, "candles": df.to_dict(orient="records"), "patterns": patterns.to_dict(orient="records")}
 
@@ -55,12 +56,10 @@ def stock_patterns(symbol: str, lookback: int = 180) -> dict[str, Any]:
 @app.get("/api/stocks/{symbol}/risk")
 def stock_risk(symbol: str, lookback: int = 180) -> dict[str, Any]:
     try:
-        df = DATA.get_ohlcv(symbol)
+        df = DATA.get_ohlcv(symbol=symbol, lookback=lookback)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    if lookback > 0:
-        df = df.tail(lookback).reset_index(drop=True)
     patterns = detect_k13_patterns(df, CFG)
     latest = None if patterns.empty else patterns.sort_values("three_idx").iloc[-1]
     risk = latest_risk_signal(df, latest)

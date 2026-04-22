@@ -5,7 +5,7 @@
 - `backend`：FastAPI + K13 因子引擎 + 风险分级接口
 - `frontend`：Vite + ECharts 可视化页面（K线、1/2/3 标注、支撑线、风险展示）
 
-> 当前使用内置模拟数据源（A股代码风格），便于你先验证规则和交互。后续可无缝替换为 Tushare / AkShare / 自有数据库。
+> 当前支持双数据源：`demo`（内置模拟）和 `tushare`（真实A股日线）。
 
 ## 目录结构
 
@@ -34,6 +34,31 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
+### 可选：切换到 Tushare 数据源
+
+在 `backend` 目录创建 `.env`（可复制 `.env.example`）：
+
+```bash
+K13_DATA_SOURCE=tushare
+TUSHARE_TOKEN=你的token
+# 可选：限定扫描股票池（逗号分隔）
+# K13_SYMBOLS=600519.SH,000858.SZ,300750.SZ
+# 可选：当未配置股票池时，自动扫描前 N 只上市股票
+# K13_SCAN_LIMIT=60
+# 可选：默认拉取日线长度
+# K13_LOOKBACK_DAYS=260
+```
+
+然后启动：
+
+```bash
+cd backend
+set -a
+source .env
+set +a
+uvicorn app.main:app --reload --port 8000
+```
+
 后端 API：
 
 - `GET /api/health`
@@ -42,6 +67,8 @@ uvicorn app.main:app --reload --port 8000
 - `GET /api/stocks/{symbol}/patterns?lookback=220`
 - `GET /api/stocks/{symbol}/risk?lookback=220`
 - `POST /api/config`
+
+其中 `GET /api/health` 会返回当前数据源（`demo/tushare`），方便你确认是否切换成功。
 
 ## 前端启动
 
@@ -64,6 +91,6 @@ npm run dev
 
 ## 下一步建议
 
-1. 将 `DataService` 替换为真实行情源；
+1. 在 Tushare 模式下接入你的完整股票池（或指数成分股池）；
 2. 在 `FactorConfig` 中继续细化你定义的“十字星、大阳/大阴合并重叠”等规则；
 3. 增加每日定时任务（收盘后跑批）和历史回测页面。
