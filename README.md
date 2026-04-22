@@ -81,6 +81,8 @@ uvicorn app.main:app --reload --port 8000
 - `watchlist` 元信息（是否启用、东方财富返回状态、自选池数量、命中数量）
 - 每条信号的 `is_watchlist` 字段（是否在你的东方财富自选池内）
 
+> 自选股读取优先走 `mx_selfselect` 接口：`/api/claw/self-select/get`；若该接口不可用，再回退到 `stock-screen` 的关键词查询。
+
 ### 全A股自动过滤规则（Tushare 模式）
 
 当使用 `K13_DATA_SOURCE=tushare` 且未设置 `K13_SYMBOLS` 时，系统默认从全A股筛选：

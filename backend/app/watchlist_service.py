@@ -10,7 +10,8 @@ import requests
 class EastmoneyWatchlistService:
     """Fetch and normalize watchlist symbols from Eastmoney Miaoxiang API."""
 
-    API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
+    SELFSELECT_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/self-select/get"
+    LEGACY_SCREEN_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
 
     def __init__(self, apikey: str | None = None) -> None:
         self.apikey = (apikey or os.getenv("EASTMONEY_APIKEY", "")).strip()
@@ -76,34 +77,79 @@ class EastmoneyWatchlistService:
         if not self.enabled:
             return set(), {"enabled": False, "message": "EASTMONEY_APIKEY 未配置"}
 
-        payload = {"keyword": self.keyword, "pageNo": 1, "pageSize": self.page_size}
         headers = {"Content-Type": "application/json", "apikey": self.apikey}
 
+        # 1) 优先使用 mx_selfselect（账户自选股管理）接口
         try:
-            resp = requests.post(self.API_URL, headers=headers, json=payload, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
+            selfselect_resp = requests.post(
+                self.SELFSELECT_API_URL,
+                headers=headers,
+                timeout=20,
+            )
+            selfselect_resp.raise_for_status()
+            selfselect_data = selfselect_resp.json()
         except Exception as exc:  # noqa: BLE001
-            return set(), {"enabled": True, "message": f"东方财富接口请求失败: {exc}"}
-
-        if not bool(data.get("success", False)) or int(data.get("status", -1)) != 0:
-            return set(), {
-                "enabled": True,
-                "message": str(data.get("message", "东方财富接口返回异常")),
-                "status": data.get("status"),
+            selfselect_data = {
+                "status": -1,
+                "message": f"self-select/get 请求失败: {exc}",
             }
 
-        node = data.get("data", {}).get("data", {})
+        if int(selfselect_data.get("status", -1)) == 0:
+            node = selfselect_data.get("data", {})
+            result = node.get("allResults", {}).get("result", {})
+            rows = result.get("dataList", [])
+            symbols = self._extract_codes_from_rows(rows)
+            meta = {
+                "enabled": True,
+                "source": "mx_selfselect",
+                "watchlist_count": len(symbols),
+                "security_count": int(node.get("securityCount", 0) or 0),
+                "message": "ok",
+            }
+            return symbols, meta
+
+        # 2) 回退到旧的 stock-screen 自然语言选股接口
+        payload = {"keyword": self.keyword, "pageNo": 1, "pageSize": self.page_size}
+        try:
+            legacy_resp = requests.post(
+                self.LEGACY_SCREEN_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            legacy_resp.raise_for_status()
+            legacy_data = legacy_resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return set(), {
+                "enabled": True,
+                "source": "legacy_stock_screen",
+                "message": f"东方财富接口请求失败: {exc}",
+            }
+
+        if not bool(legacy_data.get("success", False)) or int(legacy_data.get("status", -1)) != 0:
+            return set(), {
+                "enabled": True,
+                "source": "legacy_stock_screen",
+                "message": str(legacy_data.get("message", "东方财富接口返回异常")),
+                "status": legacy_data.get("status"),
+                "selfselect_status": selfselect_data.get("status"),
+                "selfselect_message": selfselect_data.get("message"),
+            }
+
+        node = legacy_data.get("data", {}).get("data", {})
         result = node.get("allResults", {}).get("result", {})
         rows = result.get("dataList", [])
         symbols = self._extract_codes_from_rows(rows)
 
         meta = {
             "enabled": True,
+            "source": "legacy_stock_screen",
             "keyword": self.keyword,
             "watchlist_count": len(symbols),
             "security_count": int(node.get("securityCount", 0) or 0),
             "message": "ok",
+            "selfselect_status": selfselect_data.get("status"),
+            "selfselect_message": selfselect_data.get("message"),
         }
         return symbols, meta
 
