@@ -41,6 +41,10 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 K13_DATA_SOURCE=tushare
 TUSHARE_TOKEN=你的token
+# 可选：东方财富妙想 API key（用于标记“是否自选”）
+# EASTMONEY_APIKEY=mkt_xxx
+# 可选：自选股查询关键词（默认“我的自选股”）
+# EASTMONEY_WATCHLIST_KEYWORD=我的自选股
 # 可选：限定扫描股票池（逗号分隔；留空表示全A股）
 # K13_SYMBOLS=600519.SH,000858.SZ,300750.SZ
 # 可选：股票池上限（0 表示不限制，即全市场）
@@ -73,6 +77,10 @@ uvicorn app.main:app --reload --port 8000
 
 其中 `GET /api/health` 会返回当前数据源（`demo/tushare`）及股票池过滤统计，方便你确认筛选是否生效。
 
+其中 `GET /api/signals` 会额外返回：
+- `watchlist` 元信息（是否启用、东方财富返回状态、自选池数量、命中数量）
+- 每条信号的 `is_watchlist` 字段（是否在你的东方财富自选池内）
+
 ### 全A股自动过滤规则（Tushare 模式）
 
 当使用 `K13_DATA_SOURCE=tushare` 且未设置 `K13_SYMBOLS` 时，系统默认从全A股筛选：
@@ -89,6 +97,7 @@ uvicorn app.main:app --reload --port 8000
 
 - `scan_runs`：每次扫描任务元信息（时间、数据源、股票池大小、信号数）
 - `signal_snapshots`：该次任务输出的信号快照（symbol、score、风险等级、关键价位）
+  - 含 `is_watchlist` 字段（是否自选）
 
 你可以手动执行一次：
 

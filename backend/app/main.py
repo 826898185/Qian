@@ -10,6 +10,7 @@ from .data_service import create_data_service
 from .factor_engine import FactorConfig, detect_k13_patterns, latest_risk_signal
 from .scanner import execute_scan_job
 from .storage import K13Storage
+from .watchlist_service import EastmoneyWatchlistService, annotate_signals_with_watchlist
 
 load_dotenv()
 
@@ -17,6 +18,7 @@ app = FastAPI(title="K13 Strategy API", version="0.1.0")
 CFG = FactorConfig()
 DATA = create_data_service()
 STORE = K13Storage()
+WATCHLIST = EastmoneyWatchlistService()
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,20 +42,32 @@ def symbols() -> dict[str, list[str]]:
 
 @app.get("/api/signals")
 def signals(lookback: int = 260) -> dict[str, Any]:
+    watchlist_symbols, watchlist_meta = WATCHLIST.fetch_watchlist_symbols()
+    raw_signals = DATA.scan_latest_signals(CFG, lookback=lookback)
+    enriched_signals = annotate_signals_with_watchlist(raw_signals, watchlist_symbols)
+    watchlist_meta = {
+        **watchlist_meta,
+        "matched_in_signals": sum(1 for row in enriched_signals if bool(row.get("is_watchlist"))),
+    }
+
     return {
         "config": CFG.to_dict(),
         "meta": DATA.metadata() if hasattr(DATA, "metadata") else {"source": DATA.source},
-        "signals": DATA.scan_latest_signals(CFG, lookback=lookback),
+        "watchlist": watchlist_meta,
+        "signals": enriched_signals,
     }
 
 
 @app.post("/api/scans/run")
 def run_scan(lookback: int = 260) -> dict[str, Any]:
+    watchlist_symbols, watchlist_meta = WATCHLIST.fetch_watchlist_symbols()
     result = execute_scan_job(
         data_service=DATA,
         cfg=CFG,
         storage=STORE,
         lookback=lookback,
+        watchlist_symbols=watchlist_symbols,
+        watchlist_meta=watchlist_meta,
     )
     return result
 

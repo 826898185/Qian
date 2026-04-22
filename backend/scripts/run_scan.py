@@ -8,6 +8,7 @@ from backend.app.data_service import create_data_service
 from backend.app.factor_engine import FactorConfig
 from backend.app.scanner import execute_scan_job
 from backend.app.storage import K13Storage
+from backend.app.watchlist_service import EastmoneyWatchlistService
 
 
 def main() -> None:
@@ -19,12 +20,16 @@ def main() -> None:
     service = create_data_service()
     cfg = FactorConfig()
     store = K13Storage()
+    watchlist_service = EastmoneyWatchlistService()
+    watchlist_symbols, watchlist_meta = watchlist_service.fetch_watchlist_symbols()
 
     result = execute_scan_job(
         data_service=service,
         cfg=cfg,
         storage=store,
         lookback=args.lookback,
+        watchlist_symbols=watchlist_symbols,
+        watchlist_meta=watchlist_meta,
     )
     print(
         f"[k13-scan] run_id={result['run_id']} saved_signals={result['saved_signals']} "

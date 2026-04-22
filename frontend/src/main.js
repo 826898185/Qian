@@ -29,16 +29,17 @@ document.querySelector("#app").innerHTML = `
     </div>
 
     <div class="card table-card">
-      <h3>历史 1+3 结构记录</h3>
+      <h3>今日筛选股票（含自选标记）</h3>
       <table>
         <thead>
           <tr>
+            <th>代码</th>
+            <th>是否自选</th>
             <th>核心1日期</th>
             <th>3确认日期</th>
             <th>确认时长</th>
             <th>得分</th>
-            <th>核心1收盘</th>
-            <th>3收盘</th>
+            <th>风险</th>
           </tr>
         </thead>
         <tbody id="patternTableBody"></tbody>
@@ -51,6 +52,7 @@ const state = {
   symbols: [],
   symbol: "",
   signals: [],
+  watchlist: null,
   candles: [],
   patterns: [],
   risk: null,
@@ -100,36 +102,46 @@ function renderSignalList() {
     return;
   }
 
+  const watchlistTip = state.watchlist
+    ? `<div class="muted">自选标记：命中 ${state.watchlist.matched_in_signals ?? 0} / 自选池 ${
+        state.watchlist.watchlist_count ?? 0
+      } ${state.watchlist.message && state.watchlist.message !== "ok" ? `（${state.watchlist.message}）` : ""}</div>`
+    : "";
+
   dom.signalList.innerHTML = state.signals
     .map(
       (row) => `
       <div class="signal-item">
         <h4>${row.symbol}</h4>
         <div class="muted">核心1: ${row.core1_date} / 3确认: ${row.three_date}</div>
-        <div class="muted">score: ${fmt2(row.score)} | 时长: ${row.days_from_low}天</div>
+        <div class="muted">score: ${fmt2(row.score)} | 时长: ${row.days_from_low}天 | 自选: ${
+          row.is_watchlist ? "是" : "否"
+        }</div>
         <div class="risk-tag ${riskClass(row.risk_level)}">${row.risk_level}</div>
       </div>
     `
     )
     .join("");
+  dom.signalList.innerHTML = watchlistTip + dom.signalList.innerHTML;
 }
 
 function renderPatternTable() {
-  const rows = [...state.patterns].reverse();
+  const rows = [...state.signals];
   if (!rows.length) {
-    dom.patternTableBody.innerHTML = `<tr><td colspan="6" class="muted">暂无记录</td></tr>`;
+    dom.patternTableBody.innerHTML = `<tr><td colspan="8" class="muted">暂无记录</td></tr>`;
     return;
   }
   dom.patternTableBody.innerHTML = rows
     .map(
-      (p) => `
+      (row) => `
       <tr>
-        <td>${p.core1_date}</td>
-        <td>${p.three_date}</td>
-        <td>${p.days_from_low}</td>
-        <td>${fmt2(p.score)}</td>
-        <td>${fmt2(p.core1_close)}</td>
-        <td>${fmt2(p.three_close)}</td>
+        <td>${row.symbol}</td>
+        <td>${row.is_watchlist ? "是" : "否"}</td>
+        <td>${row.core1_date ?? "-"}</td>
+        <td>${row.three_date ?? "-"}</td>
+        <td>${row.days_from_low ?? "-"}</td>
+        <td>${fmt2(row.score)}</td>
+        <td>${row.risk_level ?? "-"}</td>
       </tr>`
     )
     .join("");
@@ -242,6 +254,7 @@ function renderRisk() {
 async function loadSignals() {
   const res = await fetchJson("/api/signals");
   state.signals = res.signals || [];
+  state.watchlist = res.watchlist || null;
   renderSignalList();
 }
 

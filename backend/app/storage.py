@@ -53,6 +53,7 @@ class K13Storage:
                     three_date TEXT,
                     days_from_low INTEGER,
                     score REAL,
+                    is_watchlist INTEGER DEFAULT 0,
                     risk_level TEXT,
                     risk_message TEXT,
                     core1_open REAL,
@@ -70,6 +71,15 @@ class K13Storage:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_signal_symbol ON signal_snapshots(symbol)"
             )
+            # Backfill for older schema.
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(signal_snapshots)").fetchall()
+            }
+            if "is_watchlist" not in cols:
+                conn.execute(
+                    "ALTER TABLE signal_snapshots ADD COLUMN is_watchlist INTEGER DEFAULT 0"
+                )
 
     def save_scan_run(
         self,
@@ -106,6 +116,7 @@ class K13Storage:
                     row.get("three_date"),
                     row.get("days_from_low"),
                     row.get("score"),
+                    1 if bool(row.get("is_watchlist", False)) else 0,
                     row.get("risk_level"),
                     row.get("risk_message"),
                     row.get("core1_open"),
@@ -121,8 +132,8 @@ class K13Storage:
                 """
                 INSERT INTO signal_snapshots (
                     run_id, symbol, core1_date, three_date, days_from_low, score,
-                    risk_level, risk_message, core1_open, core1_close, core1_low, three_open, three_close
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_watchlist, risk_level, risk_message, core1_open, core1_close, core1_low, three_open, three_close
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -164,7 +175,7 @@ class K13Storage:
 
             signals = conn.execute(
                 """
-                SELECT symbol, core1_date, three_date, days_from_low, score, risk_level, risk_message,
+                SELECT symbol, core1_date, three_date, days_from_low, score, is_watchlist, risk_level, risk_message,
                        core1_open, core1_close, core1_low, three_open, three_close
                 FROM signal_snapshots
                 WHERE run_id = ?
